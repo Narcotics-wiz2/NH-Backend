@@ -18,3 +18,5 @@ If `DATABASE_URL` is not configured, the app will continue to use local JSON fil
 2. Set your database and payment provider environment variables
 3. Run `npm install`
 4. Start the app with `npm start`
+
+The backend now exposes `GET /` in addition to `/health`, `/config`, and the `/api/*` routes used by the `NH-frontend` repository.
