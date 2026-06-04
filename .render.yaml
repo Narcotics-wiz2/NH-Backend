@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: nyodera-heights-api
+    env: node
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production

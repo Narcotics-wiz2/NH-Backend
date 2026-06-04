@@ -5,5 +5,15 @@
     "password": "Admin123!",
     "role": "admin",
     "verified": true
+  },
+  {
+    "name": "Test User",
+    "email": "testuser@example.com",
+    "password": "testpass123",
+    "role": "user",
+    "verified": false,
+    "otp": "356178",
+    "otpExpires": 1780589697252,
+    "lastOtpSentAt": 1780589097252
   }
 ]

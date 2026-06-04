@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const fs = require('fs');
 const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
@@ -18,88 +19,189 @@ const BOOKINGS_FILE = path.join(__dirname, 'bookings.json');
 const PROPERTIES_FILE = path.join(__dirname, 'properties.json');
 const ROOM_SERVICES_FILE = path.join(__dirname, 'room_services.json');
 
-function readUsersFromFile() {
+const useDb = Boolean(process.env.DATABASE_URL);
+const pool = useDb ? new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
+}) : null;
+
+async function dbQuery(text, params = []) {
+  if (!useDb) throw new Error('Database not configured');
+  return pool.query(text, params);
+}
+
+function loadJsonData(filePath) {
   try {
-    const data = fs.readFileSync(USERS_FILE, 'utf8');
-    return data ? JSON.parse(data) : [];
+    if (!fs.existsSync(filePath)) return [];
+    const content = fs.readFileSync(filePath, 'utf8');
+    return content ? JSON.parse(content) : [];
   } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    console.error('Unable to read users file:', err);
+    console.error(`Unable to read ${filePath}:`, err);
     return [];
   }
 }
 
-function saveUsersToFile(users) {
-  try {
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Unable to save users file:', err);
-    throw err;
+async function initStorage() {
+  if (!useDb) {
+    console.warn('DATABASE_URL not set. Using local JSON files for storage.');
+    return;
+  }
+
+  await dbQuery(`CREATE TABLE IF NOT EXISTS users (
+      email TEXT PRIMARY KEY,
+      payload JSONB NOT NULL
+    )`);
+  await dbQuery(`CREATE TABLE IF NOT EXISTS properties (
+      id TEXT PRIMARY KEY,
+      payload JSONB NOT NULL
+    )`);
+  await dbQuery(`CREATE TABLE IF NOT EXISTS bookings (
+      id TEXT PRIMARY KEY,
+      user_email TEXT,
+      payload JSONB NOT NULL
+    )`);
+  await dbQuery(`CREATE TABLE IF NOT EXISTS room_services (
+      id TEXT PRIMARY KEY,
+      booking_id TEXT,
+      user_email TEXT,
+      payload JSONB NOT NULL
+    )`);
+
+  const usersRows = await dbQuery('SELECT 1 FROM users LIMIT 1');
+  if (usersRows.rowCount === 0) {
+    const seedUsers = loadJsonData(USERS_FILE);
+    for (const user of seedUsers) {
+      await dbQuery('INSERT INTO users(email,payload) VALUES($1,$2) ON CONFLICT (email) DO UPDATE SET payload = EXCLUDED.payload', [user.email, user]);
+    }
+  }
+
+  const propertiesRows = await dbQuery('SELECT 1 FROM properties LIMIT 1');
+  if (propertiesRows.rowCount === 0) {
+    const seedProperties = loadJsonData(PROPERTIES_FILE);
+    for (const property of seedProperties) {
+      await dbQuery('INSERT INTO properties(id,payload) VALUES($1,$2) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(property.id), property]);
+    }
+  }
+
+  const bookingsRows = await dbQuery('SELECT 1 FROM bookings LIMIT 1');
+  if (bookingsRows.rowCount === 0) {
+    const seedBookings = loadJsonData(BOOKINGS_FILE);
+    for (const booking of seedBookings) {
+      await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(booking.id), booking.userEmail || null, booking]);
+    }
+  }
+
+  const servicesRows = await dbQuery('SELECT 1 FROM room_services LIMIT 1');
+  if (servicesRows.rowCount === 0) {
+    const seedServices = loadJsonData(ROOM_SERVICES_FILE);
+    for (const service of seedServices) {
+      await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
+    }
   }
 }
 
-function readBookingsFromFile() {
-  try {
-    const data = fs.readFileSync(BOOKINGS_FILE, 'utf8');
-    return data ? JSON.parse(data) : [];
-  } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    console.error('Unable to read bookings file:', err);
-    return [];
+async function upsertRow(table, idColumn, idValue, payload) {
+  if (!useDb) {
+    throw new Error('Database not configured');
+  }
+
+  return dbQuery(
+    `INSERT INTO ${table}(${idColumn}, payload) VALUES($1, $2)
+      ON CONFLICT (${idColumn}) DO UPDATE SET payload = EXCLUDED.payload`,
+    [idValue, payload]
+  );
+}
+
+async function readUsersFromFile() {
+  if (!useDb) return loadJsonData(USERS_FILE);
+  const { rows } = await dbQuery('SELECT payload FROM users ORDER BY payload->>\'email\'');
+  return rows.map(row => row.payload);
+}
+
+async function saveUsersToFile(users) {
+  if (!useDb) {
+    try {
+      fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+      return;
+    } catch (err) {
+      console.error('Unable to save users file:', err);
+      throw err;
+    }
+  }
+
+  for (const user of users) {
+    await upsertRow('users', 'email', user.email, user);
   }
 }
 
-function readPropertiesFromFile() {
-  try {
-    const data = fs.readFileSync(PROPERTIES_FILE, 'utf8');
-    return data ? JSON.parse(data) : [];
-  } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    console.error('Unable to read properties file:', err);
-    return [];
+async function readBookingsFromFile() {
+  if (!useDb) return loadJsonData(BOOKINGS_FILE);
+  const { rows } = await dbQuery('SELECT payload FROM bookings ORDER BY payload->>\'id\'');
+  return rows.map(row => row.payload);
+}
+
+async function readPropertiesFromFile() {
+  if (!useDb) return loadJsonData(PROPERTIES_FILE);
+  const { rows } = await dbQuery('SELECT payload FROM properties ORDER BY payload->>\'id\'');
+  return rows.map(row => row.payload);
+}
+
+async function savePropertiesToFile(properties) {
+  if (!useDb) {
+    try {
+      fs.writeFileSync(PROPERTIES_FILE, JSON.stringify(properties, null, 2), 'utf8');
+      return;
+    } catch (err) {
+      console.error('Unable to save properties file:', err);
+      throw err;
+    }
+  }
+
+  for (const property of properties) {
+    await upsertRow('properties', 'id', String(property.id), property);
   }
 }
 
-function savePropertiesToFile(properties) {
-  try {
-    fs.writeFileSync(PROPERTIES_FILE, JSON.stringify(properties, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Unable to save properties file:', err);
-    throw err;
+async function saveBookingsToFile(bookings) {
+  if (!useDb) {
+    try {
+      fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(bookings, null, 2), 'utf8');
+      return;
+    } catch (err) {
+      console.error('Unable to save bookings file:', err);
+      throw err;
+    }
+  }
+
+  for (const booking of bookings) {
+    await dbQuery('INSERT INTO bookings(id,user_email,payload) VALUES($1,$2,$3) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(booking.id), booking.userEmail || null, booking]);
   }
 }
 
-function saveBookingsToFile(bookings) {
-  try {
-    fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(bookings, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Unable to save bookings file:', err);
-    throw err;
+async function readRoomServicesFromFile() {
+  if (!useDb) return loadJsonData(ROOM_SERVICES_FILE);
+  const { rows } = await dbQuery('SELECT payload FROM room_services ORDER BY payload->>\'id\'');
+  return rows.map(row => row.payload);
+}
+
+async function saveRoomServicesToFile(services) {
+  if (!useDb) {
+    try {
+      fs.writeFileSync(ROOM_SERVICES_FILE, JSON.stringify(services, null, 2), 'utf8');
+      return;
+    } catch (err) {
+      console.error('Unable to save room services file:', err);
+      throw err;
+    }
+  }
+
+  for (const service of services) {
+    await dbQuery('INSERT INTO room_services(id,booking_id,user_email,payload) VALUES($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload', [String(service.id), service.bookingId || null, service.userEmail || null, service]);
   }
 }
 
-function readRoomServicesFromFile() {
-  try {
-    const data = fs.readFileSync(ROOM_SERVICES_FILE, 'utf8');
-    return data ? JSON.parse(data) : [];
-  } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    console.error('Unable to read room services file:', err);
-    return [];
-  }
-}
-
-function saveRoomServicesToFile(services) {
-  try {
-    fs.writeFileSync(ROOM_SERVICES_FILE, JSON.stringify(services, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Unable to save room services file:', err);
-    throw err;
-  }
-}
-
-function ensureDefaultAdminUser() {
-  const users = readUsersFromFile();
+async function ensureDefaultAdminUser() {
+  const users = await readUsersFromFile();
   if (!users.find(u => u.email === 'admin@nh.test')) {
     users.push({
       name: 'Admin User',
@@ -108,11 +210,9 @@ function ensureDefaultAdminUser() {
       role: 'admin',
       verified: true
     });
-    saveUsersToFile(users);
+    await saveUsersToFile(users);
   }
 }
-
-ensureDefaultAdminUser();
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -503,15 +603,20 @@ app.get('/config', (req, res) => {
   });
 });
 
-app.get('/api/users', (req, res) => {
-  const users = readUsersFromFile().map(({ name, email, role, verified }) => ({ name, email, role, verified }));
-  res.json(users);
+app.get('/api/users', async (req, res) => {
+  try {
+    const users = await readUsersFromFile();
+    res.json(users.map(({ name, email, role, verified }) => ({ name, email, role, verified })));
+  } catch (err) {
+    console.error('GET /api/users error', err);
+    res.status(500).json({ error: 'Unable to load users' });
+  }
 });
 
 // Properties endpoints
-app.get('/api/properties', (req, res) => {
+app.get('/api/properties', async (req, res) => {
   try {
-    const properties = readPropertiesFromFile();
+    const properties = await readPropertiesFromFile();
     res.json(properties || []);
   } catch (err) {
     console.error('GET /api/properties error', err);
@@ -519,18 +624,18 @@ app.get('/api/properties', (req, res) => {
   }
 });
 
-app.patch('/api/properties/:id', (req, res) => {
+app.patch('/api/properties/:id', async (req, res) => {
   try {
     const id = req.params.id;
     const { rate_per_month } = req.body;
     if (rate_per_month == null) return res.status(400).json({ error: 'Missing rate_per_month' });
 
-    const properties = readPropertiesFromFile();
+    const properties = await readPropertiesFromFile();
     const idx = properties.findIndex(p => String(p.id) === String(id));
     if (idx === -1) return res.status(404).json({ error: 'Property not found' });
 
     properties[idx].rate_per_month = Number(rate_per_month);
-    savePropertiesToFile(properties);
+    await savePropertiesToFile(properties);
     res.json({ success: true, property: properties[idx] });
   } catch (err) {
     console.error('PATCH /api/properties/:id error', err);
@@ -539,9 +644,14 @@ app.patch('/api/properties/:id', (req, res) => {
 });
 
 // Bookings endpoints
-app.get('/api/bookings', (req, res) => {
-  const bookings = readBookingsFromFile();
-  res.json(bookings || []);
+app.get('/api/bookings', async (req, res) => {
+  try {
+    const bookings = await readBookingsFromFile();
+    res.json(bookings || []);
+  } catch (err) {
+    console.error('GET /api/bookings error', err);
+    res.status(500).json({ error: 'Unable to load bookings' });
+  }
 });
 
 app.post('/api/bookings', async (req, res) => {
@@ -551,7 +661,7 @@ app.post('/api/bookings', async (req, res) => {
       return res.status(400).json({ error: 'Missing booking data' });
     }
 
-    const bookings = readBookingsFromFile();
+    const bookings = await readBookingsFromFile();
     const isNewBooking = !bookings.find(b => String(b.id) === String(booking.id));
     
     const existing = bookings.find(b => String(b.id) === String(booking.id));
@@ -561,11 +671,11 @@ app.post('/api/bookings', async (req, res) => {
       bookings.push(booking);
     }
 
-    saveBookingsToFile(bookings);
+    await saveBookingsToFile(bookings);
     console.log('Booking saved:', booking.id, 'userEmail:', booking.userEmail, 'isNewBooking:', isNewBooking);
 
     if (isNewBooking) {
-      const users = readUsersFromFile();
+      const users = await readUsersFromFile();
       const user = users.find(u => u.email === booking.userEmail);
       const userName = user?.name || booking.userName || 'Guest';
       const emailResult = await sendBookingConfirmationEmail({
@@ -577,7 +687,7 @@ app.post('/api/bookings', async (req, res) => {
     } else {
       const previousExtensionAmount = existing.extensionPaidAmount || 0;
       if (booking.extensionPaidAmount && booking.extensionPaidAmount !== previousExtensionAmount) {
-        const users = readUsersFromFile();
+        const users = await readUsersFromFile();
         const user = users.find(u => u.email === booking.userEmail);
         const userName = user?.name || booking.userName || 'Guest';
         await sendBookingExtensionEmail({
@@ -601,7 +711,7 @@ app.post('/api/bookings/cancel-request', async (req, res) => {
     const { bookingId, refundRequested, requestedBy } = req.body || {};
     if (!bookingId) return res.status(400).json({ error: 'Missing bookingId' });
 
-    const bookings = readBookingsFromFile();
+    const bookings = await readBookingsFromFile();
     const booking = bookings.find(b => String(b.id) === String(bookingId));
     if (!booking) return res.status(404).json({ error: 'Booking not found' });
 
@@ -614,11 +724,11 @@ app.post('/api/bookings/cancel-request', async (req, res) => {
       booking.cancellation.refundAmount = Number((booking.paymentAmount * 0.5).toFixed(2));
     }
 
-    saveBookingsToFile(bookings);
+    await saveBookingsToFile(bookings);
     console.log('Cancellation requested:', booking.id, 'userEmail:', booking.userEmail, 'status:', booking.status);
 
     if (booking.userEmail) {
-      const users = readUsersFromFile();
+      const users = await readUsersFromFile();
       const user = users.find(u => u.email === booking.userEmail);
       sendEmailInBackground(async () => {
         const emailResult = await sendBookingCancellationRequestEmail({
@@ -641,7 +751,7 @@ app.post('/api/bookings/cancel-request', async (req, res) => {
 app.post('/api/bookings/:id/approve-cancellation', async (req, res) => {
   try {
     const id = req.params.id;
-    const bookings = readBookingsFromFile();
+    const bookings = await readBookingsFromFile();
     const booking = bookings.find(b => String(b.id) === String(id));
     if (!booking) return res.status(404).json({ error: 'Booking not found' });
     if (!booking.cancellation || booking.status !== 'cancellation_pending') return res.status(400).json({ error: 'No pending cancellation' });
@@ -667,10 +777,10 @@ app.post('/api/bookings/:id/approve-cancellation', async (req, res) => {
 
     booking.cancellation.status = 'approved';
     booking.status = 'cancelled';
-    saveBookingsToFile(bookings);
+    await saveBookingsToFile(bookings);
 
     if (booking.userEmail) {
-      const users = readUsersFromFile();
+      const users = await readUsersFromFile();
       const user = users.find(u => u.email === booking.userEmail);
       sendEmailInBackground(async () => {
         const emailResult = await sendMailWithLogging({
@@ -690,17 +800,17 @@ app.post('/api/bookings/:id/approve-cancellation', async (req, res) => {
 });
 
 // Deny cancellation
-app.post('/api/bookings/:id/deny-cancellation', (req, res) => {
+app.post('/api/bookings/:id/deny-cancellation', async (req, res) => {
   try {
     const id = req.params.id;
-    const bookings = readBookingsFromFile();
+    const bookings = await readBookingsFromFile();
     const booking = bookings.find(b => String(b.id) === String(id));
     if (!booking) return res.status(404).json({ error: 'Booking not found' });
     if (!booking.cancellation || booking.status !== 'cancellation_pending') return res.status(400).json({ error: 'No pending cancellation' });
 
     booking.cancellation.status = 'denied';
     booking.status = 'confirmed';
-    saveBookingsToFile(bookings);
+    await saveBookingsToFile(bookings);
 
     if (booking.userEmail) {
       sendEmailInBackground(async () => {
@@ -765,7 +875,7 @@ app.get('/api/room-service-categories', (req, res) => {
   res.json(categories);
 });
 
-app.post('/api/room-service/request', (req, res) => {
+app.post('/api/room-service/request', async (req, res) => {
   try {
     const { bookingId, userEmail, category, service, quantity = 1, specialRequests = '' } = req.body;
     
@@ -773,7 +883,7 @@ app.post('/api/room-service/request', (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const bookings = readBookingsFromFile();
+    const bookings = await readBookingsFromFile();
     const booking = bookings.find(b => String(b.id) === String(bookingId) && b.userEmail === userEmail);
     
     if (!booking) {
@@ -844,9 +954,9 @@ app.post('/api/room-service/request', (req, res) => {
       completedAt: null
     };
 
-    const services = readRoomServicesFromFile();
+    const services = await readRoomServicesFromFile();
     services.push(roomService);
-    saveRoomServicesToFile(services);
+    await saveRoomServicesToFile(services);
 
     res.json({ success: true, roomService });
   } catch (err) {
@@ -855,7 +965,7 @@ app.post('/api/room-service/request', (req, res) => {
   }
 });
 
-app.get('/api/room-service/booking/:bookingId', (req, res) => {
+app.get('/api/room-service/booking/:bookingId', async (req, res) => {
   try {
     const { bookingId } = req.params;
     const userEmail = req.query.userEmail;
@@ -864,14 +974,14 @@ app.get('/api/room-service/booking/:bookingId', (req, res) => {
       return res.status(400).json({ error: 'Missing bookingId or userEmail' });
     }
 
-    const bookings = readBookingsFromFile();
+    const bookings = await readBookingsFromFile();
     const booking = bookings.find(b => String(b.id) === String(bookingId) && b.userEmail === userEmail);
     
     if (!booking) {
       return res.status(404).json({ error: 'Booking not found' });
     }
 
-    const services = readRoomServicesFromFile();
+    const services = await readRoomServicesFromFile();
     const bookingServices = services.filter(s => s.bookingId === bookingId);
 
     res.json(bookingServices);
@@ -881,7 +991,7 @@ app.get('/api/room-service/booking/:bookingId', (req, res) => {
   }
 });
 
-app.patch('/api/room-service/:id/status', (req, res) => {
+app.patch('/api/room-service/:id/status', async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -890,7 +1000,7 @@ app.patch('/api/room-service/:id/status', (req, res) => {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
-    const services = readRoomServicesFromFile();
+    const services = await readRoomServicesFromFile();
     const service = services.find(s => s.id === id);
 
     if (!service) {
@@ -902,7 +1012,7 @@ app.patch('/api/room-service/:id/status', (req, res) => {
       service.completedAt = new Date().toISOString();
     }
 
-    saveRoomServicesToFile(services);
+    await saveRoomServicesToFile(services);
     res.json({ success: true, roomService: service });
   } catch (err) {
     console.error('room-service status update error', err);
@@ -910,7 +1020,7 @@ app.patch('/api/room-service/:id/status', (req, res) => {
   }
 });
 
-app.post('/api/room-service/:id/cancel', (req, res) => {
+app.post('/api/room-service/:id/cancel', async (req, res) => {
   try {
     const { id } = req.params;
     const { userEmail } = req.body;
@@ -919,7 +1029,7 @@ app.post('/api/room-service/:id/cancel', (req, res) => {
       return res.status(400).json({ error: 'Missing userEmail' });
     }
 
-    const services = readRoomServicesFromFile();
+    const services = await readRoomServicesFromFile();
     const service = services.find(s => s.id === id && s.userEmail === userEmail);
 
     if (!service) {
@@ -931,7 +1041,7 @@ app.post('/api/room-service/:id/cancel', (req, res) => {
     }
 
     service.status = 'cancelled';
-    saveRoomServicesToFile(services);
+    await saveRoomServicesToFile(services);
 
     res.json({ success: true, roomService: service });
   } catch (err) {
@@ -941,31 +1051,36 @@ app.post('/api/room-service/:id/cancel', (req, res) => {
 });
 
 app.post('/api/auth/signup', async (req, res) => {
-  const { name, email, password } = req.body;
-  if (!name || !email || !password) {
-    return res.status(400).json({ error: 'Missing name, email, or password' });
+  try {
+    const { name, email, password } = req.body;
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'Missing name, email, or password' });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const users = await readUsersFromFile();
+    const existingUser = users.find(u => u.email === normalizedEmail);
+    if (existingUser) {
+      return res.status(409).json({ error: 'Email already registered' });
+    }
+
+    const user = { name: name.trim(), email: normalizedEmail, password, role: 'user', verified: false };
+    users.push(user);
+    await saveUsersToFile(users);
+
+    res.json({ email: user.email, name: user.name, role: user.role, verified: false });
+  } catch (err) {
+    console.error('signup error', err);
+    res.status(500).json({ error: 'Unable to sign up user' });
   }
-
-  const normalizedEmail = email.trim().toLowerCase();
-  const users = readUsersFromFile();
-  const existingUser = users.find(u => u.email === normalizedEmail);
-  if (existingUser) {
-    return res.status(409).json({ error: 'Email already registered' });
-  }
-
-  const user = { name: name.trim(), email: normalizedEmail, password, role: 'user', verified: false };
-  users.push(user);
-  saveUsersToFile(users);
-
-  res.json({ email: user.email, name: user.name, role: user.role, verified: false });
 });
 
-app.post('/api/auth/verify-otp', (req, res) => {
+app.post('/api/auth/verify-otp', async (req, res) => {
   try {
     const { email, otp } = req.body || {};
     if (!email || !otp) return res.status(400).json({ error: 'Missing email or otp' });
     const normalizedEmail = String(email).trim().toLowerCase();
-    const users = readUsersFromFile();
+    const users = await readUsersFromFile();
     const user = users.find(u => u.email === normalizedEmail);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (user.verified) return res.json({ success: true, message: 'Already verified', email: user.email, name: user.name, role: user.role });
@@ -976,7 +1091,7 @@ app.post('/api/auth/verify-otp', (req, res) => {
     user.verified = true;
     delete user.otp;
     delete user.otpExpires;
-    saveUsersToFile(users);
+    await saveUsersToFile(users);
 
     res.json({ success: true, email: user.email, name: user.name, role: user.role, verified: true });
   } catch (err) {
@@ -990,7 +1105,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'Missing email' });
     const normalizedEmail = String(email).trim().toLowerCase();
-    const users = readUsersFromFile();
+    const users = await readUsersFromFile();
     const user = users.find(u => u.email === normalizedEmail);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (user.verified) return res.status(400).json({ error: 'User already verified' });
@@ -1005,7 +1120,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
     user.otp = otp;
     user.otpExpires = now + (10 * 60 * 1000);
     user.lastOtpSentAt = now;
-    saveUsersToFile(users);
+    await saveUsersToFile(users);
 
     let emailSend = { mode: 'unknown' };
     try {
@@ -1027,7 +1142,7 @@ app.post('/api/auth/send-verification', async (req, res) => {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'Missing email' });
     const normalizedEmail = String(email).trim().toLowerCase();
-    const users = readUsersFromFile();
+    const users = await readUsersFromFile();
     const user = users.find(u => u.email === normalizedEmail);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (user.verified) return res.status(400).json({ error: 'User already verified' });
@@ -1043,7 +1158,7 @@ app.post('/api/auth/send-verification', async (req, res) => {
     user.otp = otp;
     user.otpExpires = now + (10 * 60 * 1000);
     user.lastOtpSentAt = now;
-    saveUsersToFile(users);
+    await saveUsersToFile(users);
 
     let emailSend = { mode: 'unknown' };
     try {
@@ -1060,57 +1175,72 @@ app.post('/api/auth/send-verification', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Missing email or password' });
-  }
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Missing email or password' });
+    }
 
-  const normalizedEmail = email.trim().toLowerCase();
-  const users = readUsersFromFile();
-  const user = users.find(u => u.email === normalizedEmail && u.password === password);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
+    const normalizedEmail = email.trim().toLowerCase();
+    const users = await readUsersFromFile();
+    const user = users.find(u => u.email === normalizedEmail && u.password === password);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
-  if (!user.verified) {
-    return res.status(401).json({ error: 'Email not verified', requiresVerification: true, verified: false });
-  }
+    if (!user.verified) {
+      return res.status(401).json({ error: 'Email not verified', requiresVerification: true, verified: false });
+    }
 
-  res.json({ email: user.email, name: user.name, role: user.role, verified: true });
+    res.json({ email: user.email, name: user.name, role: user.role, verified: true });
+  } catch (err) {
+    console.error('login error', err);
+    res.status(500).json({ error: 'Unable to login' });
+  }
 });
 
-app.get('/api/auth/me', (req, res) => {
-  const email = String(req.query.email || '').trim().toLowerCase();
-  if (!email) return res.status(400).json({ error: 'Missing email' });
+app.get('/api/auth/me', async (req, res) => {
+  try {
+    const email = String(req.query.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Missing email' });
 
-  const users = readUsersFromFile();
-  const user = users.find(u => u.email === email);
-  if (!user) return res.status(404).json({ error: 'User not found' });
+    const users = await readUsersFromFile();
+    const user = users.find(u => u.email === email);
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
-  res.json({ email: user.email, name: user.name, role: user.role, verified: user.verified !== false });
+    res.json({ email: user.email, name: user.name, role: user.role, verified: user.verified !== false });
+  } catch (err) {
+    console.error('auth/me error', err);
+    res.status(500).json({ error: 'Unable to load user details' });
+  }
 });
 
-app.patch('/api/auth/password', (req, res) => {
-  const { email, currentPassword, newPassword } = req.body;
-  if (!email || !currentPassword || !newPassword) {
-    return res.status(400).json({ error: 'Missing email, current password, or new password' });
-  }
+app.patch('/api/auth/password', async (req, res) => {
+  try {
+    const { email, currentPassword, newPassword } = req.body;
+    if (!email || !currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Missing email, current password, or new password' });
+    }
 
-  const normalizedEmail = email.trim().toLowerCase();
-  const users = readUsersFromFile();
-  const user = users.find(u => u.email === normalizedEmail);
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
+    const normalizedEmail = email.trim().toLowerCase();
+    const users = await readUsersFromFile();
+    const user = users.find(u => u.email === normalizedEmail);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
 
-  if (user.password !== currentPassword) {
-    return res.status(401).json({ error: 'Current password is incorrect' });
-  }
+    if (user.password !== currentPassword) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
 
-  user.password = newPassword;
-  saveUsersToFile(users);
-  res.json({ success: true, message: 'Password updated' });
+    user.password = newPassword;
+    await saveUsersToFile(users);
+    res.json({ success: true, message: 'Password updated' });
+  } catch (err) {
+    console.error('password update error', err);
+    res.status(500).json({ error: 'Unable to update password' });
+  }
 });
 
 app.post('/send-reset-email', async (req, res) => {
@@ -1121,14 +1251,14 @@ app.post('/send-reset-email', async (req, res) => {
     }
 
     const normalizedEmail = email.trim().toLowerCase();
-    const users = readUsersFromFile();
+    const users = await readUsersFromFile();
     const user = users.find(u => u.email === normalizedEmail);
     if (!user) {
       return res.status(404).json({ error: 'No user found for that email' });
     }
 
     user.password = tempPassword;
-    saveUsersToFile(users);
+    await saveUsersToFile(users);
 
     const { previewUrl, mode } = await sendResetEmail({ email: user.email, name: user.name, tempPassword });
     res.json({ success: true, previewUrl, mode });
@@ -1300,4 +1430,14 @@ app.use((req, res) => {
 });
 
 const PORT = process.env.PORT || 4242;
-app.listen(PORT, () => console.log(`Nyodera Heights API backend listening on port ${PORT}`));
+
+async function startServer() {
+  await initStorage();
+  await ensureDefaultAdminUser();
+  app.listen(PORT, () => console.log(`Nyodera Heights API backend listening on port ${PORT}`));
+}
+
+startServer().catch(err => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+});
