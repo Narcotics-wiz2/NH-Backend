@@ -11,7 +11,23 @@ const path = require('path');
 const { Pool } = require('pg');
 
 const app = express();
-app.use(cors());
+app.set('trust proxy', 1);
+
+const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || `${process.env.FRONTEND_URL || ''},http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173,https://panel.bwmxmd.co.ke`)
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) return callback(null, true);
+    const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+    if (isLocalhost) return callback(null, true);
+    callback(null, false);
+  },
+  credentials: true,
+}));
 app.use(express.json());
 
 const USERS_FILE = path.join(__dirname, 'users.json');
@@ -214,7 +230,14 @@ async function ensureDefaultAdminUser() {
   }
 }
 
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
+function requireStripe() {
+  if (!stripe) {
+    throw new Error('Stripe is not configured');
+  }
+  return stripe;
+}
 
 // PayPal client helper
 function paypalClient() {
@@ -564,17 +587,22 @@ app.post('/create-checkout-session', async (req, res) => {
     const { amount, currency = 'usd' } = req.body;
     if (!amount) return res.status(400).json({ error: 'Missing amount' });
 
-    const session = await stripe.checkout.sessions.create({
+    const stripeClient = requireStripe();
+    const frontendOrigin = req.headers.origin || process.env.FRONTEND_URL || process.env.PUBLIC_URL || 'http://localhost:3000';
+    const session = await stripeClient.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
       line_items: [{ price_data: { currency, product_data: { name: 'Nyodera Heights Payment' }, unit_amount: Math.round(amount * 100) }, quantity: 1 }],
-      success_url: `${req.headers.origin}/payments.html?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${req.headers.origin}/payments.html?canceled=true`
+      success_url: `${frontendOrigin}/payments.html?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendOrigin}/payments.html?canceled=true`
     });
 
     res.json({ id: session.id });
   } catch (err) {
     console.error(err);
+    if (err.message === 'Stripe is not configured') {
+      return res.status(503).json({ error: 'Stripe is not configured' });
+    }
     res.status(500).json({ error: 'Stripe error' });
   }
 });
@@ -602,10 +630,14 @@ app.post('/create-paypal-order', async (req, res) => {
 
 app.get('/checkout-session/:id', async (req, res) => {
   try {
-    const session = await stripe.checkout.sessions.retrieve(req.params.id, { expand: ['payment_intent'] });
+    const stripeClient = requireStripe();
+    const session = await stripeClient.checkout.sessions.retrieve(req.params.id, { expand: ['payment_intent'] });
     res.json(session);
   } catch (err) {
     console.error(err);
+    if (err.message === 'Stripe is not configured') {
+      return res.status(503).json({ error: 'Stripe is not configured' });
+    }
     res.status(500).json({ error: 'Unable to retrieve Stripe session' });
   }
 });
@@ -1400,9 +1432,10 @@ app.post('/refund', async (req, res) => {
     if (provider.toLowerCase() === 'stripe') {
       if (!process.env.STRIPE_SECRET_KEY) return res.status(400).json({ error: 'Stripe not configured' });
 
+      const stripeClient = requireStripe();
       let paymentIntentId = null;
       try {
-        const session = await stripe.checkout.sessions.retrieve(paymentId);
+        const session = await stripeClient.checkout.sessions.retrieve(paymentId);
         paymentIntentId = session.payment_intent || null;
       } catch (e) {
         paymentIntentId = paymentId;
@@ -1412,7 +1445,7 @@ app.post('/refund', async (req, res) => {
       if (paymentIntentId) refundParams.payment_intent = paymentIntentId;
       if (amount) refundParams.amount = Math.round(Number(amount) * 100);
 
-      const refund = await stripe.refunds.create(refundParams);
+      const refund = await stripeClient.refunds.create(refundParams);
       return res.json({ success: true, refund });
     }
 
@@ -1445,15 +1478,25 @@ app.use((req, res) => {
   res.status(404).json({ error: 'API endpoint not found', path: req.path, method: req.method });
 });
 
-const PORT = process.env.PORT || 4242;
+const HOST = process.env.HOST || '0.0.0.0';
+const PORT = Number(process.env.PORT || 4242);
 
 async function startServer() {
   await initStorage();
   await ensureDefaultAdminUser();
-  app.listen(PORT, () => console.log(`Nyodera Heights API backend listening on port ${PORT}`));
+  return new Promise((resolve) => {
+    const server = app.listen(PORT, HOST, () => {
+      console.log(`Nyodera Heights API backend listening on http://${HOST}:${PORT}`);
+      resolve(server);
+    });
+  });
 }
 
-startServer().catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  startServer().catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = { app, startServer };
