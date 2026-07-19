@@ -40,7 +40,7 @@ const ROOM_SERVICES_FILE = path.join(__dirname, 'room_services.json');
 const envDbType = (process.env.DATABASE_TYPE || '').toLowerCase();
 const inferredType = process.env.DATABASE_URL && process.env.DATABASE_URL.startsWith('mysql') ? 'mysql' : 'pg';
 const dbClientType = envDbType === 'mysql' ? 'mysql' : (envDbType === 'pg' || envDbType === 'postgres' ? 'pg' : (process.env.DATABASE_URL ? inferredType : null));
-const useDb = Boolean(dbClientType);
+let useDb = Boolean(dbClientType);
 let pool = null;
 if (dbClientType === 'pg') {
   pool = new Pool({
@@ -48,7 +48,6 @@ if (dbClientType === 'pg') {
     ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
   });
 } else if (dbClientType === 'mysql') {
-  // Build mysql config from MYSQL_* env vars or from DATABASE_URL / JDBC_DATABASE_URL
   const mysqlConfig = {};
   if (process.env.MYSQL_HOST) {
     mysqlConfig.host = process.env.MYSQL_HOST;
@@ -82,6 +81,10 @@ if (dbClientType === 'pg') {
   if (Object.keys(mysqlConfig).length > 0) {
     pool = mysql.createPool(Object.assign({ waitForConnections: true, connectionLimit: 10 }, mysqlConfig));
   }
+}
+
+if (!pool) {
+  useDb = false;
 }
 
 async function dbQuery(text, params = []) {
@@ -1605,7 +1608,12 @@ const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 4242);
 
 async function startServer() {
-  await initStorage();
+  try {
+    await initStorage();
+  } catch (err) {
+    console.error('Database initialization failed, falling back to local JSON storage:', err.message || err);
+    console.warn('Continuing startup in JSON file mode. Set a valid MySQL or PostgreSQL configuration to enable database storage.');
+  }
   await ensureDefaultAdminUser();
   return new Promise((resolve) => {
     const server = app.listen(PORT, HOST, () => {
