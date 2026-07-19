@@ -1,0 +1,32 @@
+# Panel deployment commands
+# Open this file on GitHub to use the copy button: https://github.com/Narcotics-wiz2/NH-Backend/blob/main/panel-commands.txt
+
+# 1) SSH into the panel host and go to the project directory
+ssh -p 2022 nh_server.1563265a@panel.bwmxmd.co.ke
+cd /home/container
+
+# 2) Pull latest code and use deploy.env as .env
+git fetch origin
+git reset --hard origin/main
+cp -f deploy.env .env
+
+# 3) Install dependencies (fast) and run DB connectivity test
+npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+npm run db-test
+
+# 4) Start/restart the app with PM2 (preferred)
+pm install -g pm2 || true
+pm2 restart nyodera || pm2 start ecosystem.config.js || ./start-panel.sh
+
+# 5) Check logs
+pm2 status
+pm2 logs nyodera --lines 200
+
+# QUICK FALLBACK (if DB still refuses): disable DB in .env and restart
+cp .env .env.bak.$(date +%s)
+sed -E "s/^(MYSQL_|DATABASE_URL|DATABASE_TYPE=)/#\0/" .env.bak.$(date +%s) > .env
+pm2 restart nyodera || ./start-panel.sh
+
+# Notes:
+# - If you prefer, run ./start-panel.sh to perform install/test/start automatically.
+# - If you have trouble copying on mobile, open this file in the GitHub repo and use the Copy button on the web UI.
