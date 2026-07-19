@@ -59,6 +59,13 @@ pm2 status
 pm2 logs nyodera --lines 200
 ```
 
+Alternatively, run the deployment helper script on the panel host:
+
+```bash
+cd /home/container
+./start-panel.sh
+```
+
 The app should now serve on the configured `HOST` and `PORT` values.
 
 The backend exposes `GET /` in addition to `/health`, `/config`, and the `/api/*` routes used by the `NH-frontend` repository.
