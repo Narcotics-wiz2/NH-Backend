@@ -87,6 +87,13 @@ if (!pool) {
   useDb = false;
 }
 
+// Allow forcing JSON/local storage mode (useful when the panel DB is offline)
+if ((process.env.FORCE_JSON_STORAGE || '').toLowerCase() === 'true') {
+  console.warn('FORCE_JSON_STORAGE=true — forcing local JSON file storage and disabling DB mode');
+  useDb = false;
+  pool = null;
+}
+
 function disableDbMode(reason) {
   if (!useDb) return;
   console.warn('Disabling database mode due to error:', reason);

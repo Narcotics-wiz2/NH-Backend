@@ -69,3 +69,7 @@ cd /home/container
 The app should now serve on the configured `HOST` and `PORT` values.
 
 The backend exposes `GET /` in addition to `/health`, `/config`, and the `/api/*` routes used by the `NH-frontend` repository.
+
+### Force local JSON storage
+
+If your panel database is unreachable, you can force the backend to use local JSON files instead of attempting a DB connection by setting `FORCE_JSON_STORAGE=true` in your `.env` (or in `deploy.env` before copying it to `.env`). This is useful when the panel is offline — it keeps the app running while you restore DB connectivity.
