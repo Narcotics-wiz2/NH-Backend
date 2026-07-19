@@ -1650,7 +1650,7 @@ app.use((req, res) => {
 });
 
 const HOST = process.env.HOST || '0.0.0.0';
-const PORT = Number(process.env.PORT || 4242);
+const PORT = Number(process.env.PORT || 25005);
 
 async function startServer() {
   try {

@@ -69,6 +69,7 @@ cd /home/container
 The app should now serve on the configured `HOST` and `PORT` values.
 
 The backend exposes `GET /` in addition to `/health`, `/config`, and the `/api/*` routes used by the `NH-frontend` repository.
+The default panel deployment port is `25005`.
 
 ### Force local JSON storage
 
